@@ -1,7 +1,7 @@
 {
   "name": "mediargapi",
   "version": "1.0.0",
-  "description": "MediaRG API (in-memory version)",
+  "description": "MediaRG API (Blob + Cosmos)",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
@@ -11,8 +11,11 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@azure/cosmos": "^3.0.0",
+    "@azure/storage-blob": "^12.17.0",
     "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1"
   }
 }
 
