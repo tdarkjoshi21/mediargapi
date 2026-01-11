@@ -1,291 +1,180 @@
 const express = require("express");
 const cors = require("cors");
-const multer = require("multer");
-
-const { BlobServiceClient } = require("@azure/storage-blob");
-const { CosmosClient } = require("@azure/cosmos");
 
 const app = express();
 
-// ---- CORS ----
+// ---- CORS (use env var in Azure) ----
 const allowedOrigin = process.env.CORS_ORIGIN || "*";
 app.use(
   cors({
-    origin: allowedOrigin === "*" ? true : allowedOrigin,
+    origin: allowedOrigin === "*" ? true : allowedOrigin
   })
 );
 
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json());
 
-// ---- Multer (memory upload) ----
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-});
+// ---- In-memory data ----
+let photos = [
+  {
+    id: "1",
+    title: "Sample Photo",
+    url: "https://via.placeholder.com/600x400",
+    caption: "This is a placeholder image",
+    location: "Demo",
+    people: ["DemoUser"],
+    createdAt: new Date().toISOString()
+  }
+];
 
-// ---- Env ----
-const AZURE_STORAGE_CONNECTION = process.env.AZURE_STORAGE_CONNECTION;
-const BLOB_CONTAINER_NAME = process.env.BLOB_CONTAINER_NAME || "images";
-
-const COSMOS_ENDPOINT = process.env.COSMOS_ENDPOINT;
-const COSMOS_KEY = process.env.COSMOS_KEY;
-const COSMOS_DB_NAME = process.env.COSMOS_DB_NAME || "mediasharedb";
-
-const COSMOS_CONTAINER = process.env.COSMOS_CONTAINER || "photos";
-const COSMOS_COMMENT_CONTAINER =
-  process.env.COSMOS_COMMENT_CONTAINER || "comments";
-const COSMOS_RATINGS_CONTAINER =
-  process.env.COSMOS_RATINGS_CONTAINER || "ratings";
-
-// ---- Clients ----
-function assertEnv(name, value) {
-  if (!value) throw new Error(`Missing required env var: ${name}`);
-}
-
-assertEnv("AZURE_STORAGE_CONNECTION", AZURE_STORAGE_CONNECTION);
-assertEnv("COSMOS_ENDPOINT", COSMOS_ENDPOINT);
-assertEnv("COSMOS_KEY", COSMOS_KEY);
-
-const blobServiceClient = BlobServiceClient.fromConnectionString(
-  AZURE_STORAGE_CONNECTION
-);
-
-const cosmosClient = new CosmosClient({
-  endpoint: COSMOS_ENDPOINT,
-  key: COSMOS_KEY,
-});
-
-const db = cosmosClient.database(COSMOS_DB_NAME);
-const photosContainer = db.container(COSMOS_CONTAINER);
-const commentsContainer = db.container(COSMOS_COMMENT_CONTAINER);
-const ratingsContainer = db.container(COSMOS_RATINGS_CONTAINER);
+const commentsByPhoto = {}; // { photoId: [{name,text,createdAt}] }
+const ratingsByPhoto = {};  // { photoId: [{value,createdAt}] }
 
 // ---- Helpers ----
 function nowIso() {
   return new Date().toISOString();
 }
 
-function safePeopleArray(peopleRaw) {
-  if (!peopleRaw) return [];
-  if (Array.isArray(peopleRaw)) return peopleRaw.map(String).filter(Boolean);
-  return String(peopleRaw)
+function toPeopleArray(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw.map(String).filter(Boolean);
+  return String(raw)
     .split(",")
     .map((x) => x.trim())
     .filter(Boolean);
 }
 
-function buildSearchPredicate(q) {
-  const s = String(q || "").trim().toLowerCase();
-  return s;
+function calcRatingSummary(photoId) {
+  const ratings = ratingsByPhoto[photoId] || [];
+  const count = ratings.length;
+  const avg = count
+    ? ratings.reduce((sum, r) => sum + Number(r.value || 0), 0) / count
+    : 0;
+  return { count, average: Number(avg.toFixed(2)) };
 }
 
-// ---- Health ----
-app.get("/", (req, res) => res.send("SharePic API is running"));
-
-// ---- GET photos (supports ?q=search) ----
-app.get("/api/photos", async (req, res) => {
-  try {
-    const q = buildSearchPredicate(req.query.q);
-    // simple SQL search across some fields
-    // NOTE: This assumes your container partition key doesn’t block this query.
-    // If you use partition key like /id you can still query cross partition.
-    const querySpec = q
-      ? {
-          query: `
-            SELECT * FROM c
-            WHERE CONTAINS(LOWER(c.title), @q)
-               OR CONTAINS(LOWER(c.caption), @q)
-               OR CONTAINS(LOWER(c.location), @q)
-               OR ARRAY_CONTAINS(c.people, @q, true)
-            ORDER BY c.createdAt DESC
-          `,
-          parameters: [{ name: "@q", value: q }],
-        }
-      : {
-          query: "SELECT * FROM c ORDER BY c.createdAt DESC",
-        };
-
-    const { resources } = await photosContainer.items
-      .query(querySpec, { enableCrossPartitionQuery: true })
-      .fetchAll();
-
-    res.json(resources);
-  } catch (err) {
-    console.error("GET /api/photos error:", err);
-    res.status(500).json({ error: "Failed to fetch photos" });
-  }
+// ---- Routes ----
+app.get("/", (req, res) => {
+  res.json({
+    status: "MediaRG API is running ✅",
+    corsOrigin: allowedOrigin
+  });
 });
 
-// ---- GET photo by id ----
-app.get("/api/photos/:id", async (req, res) => {
-  try {
-    const id = req.params.id;
-    // if your container uses partition key = /id, this works:
-    const { resource } = await photosContainer.item(id, id).read();
-    if (!resource) return res.status(404).json({ error: "Photo not found" });
-    res.json(resource);
-  } catch (err) {
-    console.error("GET /api/photos/:id error:", err);
-    res.status(404).json({ error: "Photo not found" });
-  }
+app.get("/health", (req, res) => {
+  res.json({ ok: true, time: nowIso() });
 });
 
-// ---- POST photo upload (creator) ----
-// multipart/form-data fields: file, title, caption, location, people
-app.post("/api/photos", upload.single("file"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "Missing file" });
+// GET photos (supports ?q=)
+app.get("/api/photos", (req, res) => {
+  const q = String(req.query.q || "").trim().toLowerCase();
 
-    const title = (req.body.title || "").trim();
-    const caption = (req.body.caption || "").trim();
-    const location = (req.body.location || "").trim();
-    const people = safePeopleArray(req.body.people);
-
-    if (!title) return res.status(400).json({ error: "Title is required" });
-
-    // upload to blob
-    const containerClient =
-      blobServiceClient.getContainerClient(BLOB_CONTAINER_NAME);
-    await containerClient.createIfNotExists({ access: "blob" });
-
-    const ext = (req.file.originalname.split(".").pop() || "jpg").toLowerCase();
-    const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const blobName = `${id}.${ext}`;
-
-    const blockBlobClient = containerClient.getBlockBlobClient(blobName);
-    await blockBlobClient.uploadData(req.file.buffer, {
-      blobHTTPHeaders: { blobContentType: req.file.mimetype },
+  let result = photos;
+  if (q) {
+    result = photos.filter((p) => {
+      const people = (p.people || []).join(" ").toLowerCase();
+      return (
+        (p.title || "").toLowerCase().includes(q) ||
+        (p.caption || "").toLowerCase().includes(q) ||
+        (p.location || "").toLowerCase().includes(q) ||
+        people.includes(q)
+      );
     });
-
-    const url = blockBlobClient.url;
-
-    // write metadata to cosmos
-    const doc = {
-      id, // also used as partition key if /id
-      title,
-      caption,
-      location,
-      people,
-      blobName,
-      url,
-      contentType: req.file.mimetype,
-      createdAt: nowIso(),
-    };
-
-    await photosContainer.items.create(doc);
-
-    res.json({ message: "Photo uploaded", photo: doc });
-  } catch (err) {
-    console.error("POST /api/photos error:", err);
-    res.status(500).json({ error: "Upload failed" });
   }
+
+  const withRatings = result.map((p) => ({
+    ...p,
+    rating: calcRatingSummary(p.id)
+  }));
+
+  console.log(`GET /api/photos q="${q}" -> ${withRatings.length} item(s)`);
+  res.json(withRatings);
 });
 
-// ---- POST comment (consumer) ----
-// body: { name?, text }
-app.post("/api/photos/:id/comments", async (req, res) => {
-  try {
-    const photoId = req.params.id;
-    const name = (req.body.name || "Anonymous").trim();
-    const text = (req.body.text || "").trim();
+// GET photo by id
+app.get("/api/photos/:id", (req, res) => {
+  const id = String(req.params.id);
+  const photo = photos.find((p) => p.id === id);
 
-    if (!text) return res.status(400).json({ error: "Comment text required" });
+  if (!photo) return res.status(404).json({ error: "Photo not found" });
 
-    const comment = {
-      id: `${photoId}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      photoId,
-      name,
-      text,
-      createdAt: nowIso(),
-    };
-
-    await commentsContainer.items.create(comment);
-    res.json({ message: "Comment added", comment });
-  } catch (err) {
-    console.error("POST /comments error:", err);
-    res.status(500).json({ error: "Failed to add comment" });
-  }
+  console.log(`GET /api/photos/${id}`);
+  res.json({
+    ...photo,
+    rating: calcRatingSummary(id),
+    comments: commentsByPhoto[id] || []
+  });
 });
 
-// ---- GET comments for a photo ----
-app.get("/api/photos/:id/comments", async (req, res) => {
-  try {
-    const photoId = req.params.id;
+// POST photo (metadata only)
+app.post("/api/photos", (req, res) => {
+  const { title, url, caption, location, people } = req.body || {};
 
-    const querySpec = {
-      query: "SELECT * FROM c WHERE c.photoId = @photoId ORDER BY c.createdAt DESC",
-      parameters: [{ name: "@photoId", value: photoId }],
-    };
-
-    const { resources } = await commentsContainer.items
-      .query(querySpec, { enableCrossPartitionQuery: true })
-      .fetchAll();
-
-    res.json(resources);
-  } catch (err) {
-    console.error("GET comments error:", err);
-    res.status(500).json({ error: "Failed to fetch comments" });
+  if (!title || !url) {
+    return res.status(400).json({ error: "title and url are required" });
   }
+
+  const newPhoto = {
+    id: String(Date.now()),
+    title: String(title).trim(),
+    url: String(url).trim(),
+    caption: String(caption || "").trim(),
+    location: String(location || "").trim(),
+    people: toPeopleArray(people),
+    createdAt: nowIso()
+  };
+
+  photos.unshift(newPhoto);
+  console.log("POST /api/photos created:", newPhoto.id);
+
+  res.status(201).json({ message: "Photo added", photo: newPhoto });
 });
 
-// ---- POST rating (consumer) ----
-// body: { value: 1..5, userKey?: string }
-// userKey is a simple identifier to prevent multiple ratings (not real auth).
-app.post("/api/photos/:id/rating", async (req, res) => {
-  try {
-    const photoId = req.params.id;
-    const value = Number(req.body.value);
+// POST comment
+app.post("/api/photos/:id/comments", (req, res) => {
+  const id = String(req.params.id);
+  const photo = photos.find((p) => p.id === id);
+  if (!photo) return res.status(404).json({ error: "Photo not found" });
 
-    if (!Number.isFinite(value) || value < 1 || value > 5) {
-      return res.status(400).json({ error: "Rating must be 1..5" });
-    }
+  const name = String(req.body?.name || "Anonymous").trim();
+  const text = String(req.body?.text || "").trim();
+  if (!text) return res.status(400).json({ error: "Comment text required" });
 
-    const userKey = (req.body.userKey || "anon").toString().slice(0, 120);
+  commentsByPhoto[id] = commentsByPhoto[id] || [];
+  const comment = { name, text, createdAt: nowIso() };
+  commentsByPhoto[id].unshift(comment);
 
-    // upsert: one rating per photo per userKey
-    const ratingId = `${photoId}::${userKey}`;
-
-    const ratingDoc = {
-      id: ratingId,
-      photoId,
-      userKey,
-      value,
-      updatedAt: nowIso(),
-    };
-
-    await ratingsContainer.items.upsert(ratingDoc);
-    res.json({ message: "Rating saved", rating: ratingDoc });
-  } catch (err) {
-    console.error("POST rating error:", err);
-    res.status(500).json({ error: "Failed to save rating" });
-  }
+  console.log(`POST /api/photos/${id}/comments`);
+  res.status(201).json({ message: "Comment added", comment });
 });
 
-// ---- GET rating summary for a photo ----
-app.get("/api/photos/:id/rating", async (req, res) => {
-  try {
-    const photoId = req.params.id;
-
-    const querySpec = {
-      query: "SELECT c.value FROM c WHERE c.photoId = @photoId",
-      parameters: [{ name: "@photoId", value: photoId }],
-    };
-
-    const { resources } = await ratingsContainer.items
-      .query(querySpec, { enableCrossPartitionQuery: true })
-      .fetchAll();
-
-    const values = resources.map((r) => r.value);
-    const count = values.length;
-    const avg = count ? values.reduce((a, b) => a + b, 0) / count : 0;
-
-    res.json({ photoId, count, average: Number(avg.toFixed(2)) });
-  } catch (err) {
-    console.error("GET rating error:", err);
-    res.status(500).json({ error: "Failed to fetch rating" });
-  }
+// GET comments
+app.get("/api/photos/:id/comments", (req, res) => {
+  const id = String(req.params.id);
+  res.json(commentsByPhoto[id] || []);
 });
 
+// POST rating
+app.post("/api/photos/:id/rating", (req, res) => {
+  const id = String(req.params.id);
+  const photo = photos.find((p) => p.id === id);
+  if (!photo) return res.status(404).json({ error: "Photo not found" });
+
+  const value = Number(req.body?.value);
+  if (!Number.isFinite(value) || value < 1 || value > 5) {
+    return res.status(400).json({ error: "Rating must be a number 1..5" });
+  }
+
+  ratingsByPhoto[id] = ratingsByPhoto[id] || [];
+  ratingsByPhoto[id].push({ value, createdAt: nowIso() });
+
+  console.log(`POST /api/photos/${id}/rating value=${value}`);
+  res.status(201).json({
+    message: "Rating added",
+    rating: calcRatingSummary(id)
+  });
+});
+
+// ---- Start ----
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`API running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ MediaRG API running on port ${PORT}`));
 
