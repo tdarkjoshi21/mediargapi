@@ -7,23 +7,19 @@ const { CosmosClient } = require("@azure/cosmos");
 
 const app = express();
 
-// ----- CORS -----
+// CORS
 const allowedOrigin = process.env.CORS_ORIGIN || "*";
-app.use(
-  cors({
-    origin: allowedOrigin === "*" ? true : allowedOrigin
-  })
-);
+app.use(cors({ origin: allowedOrigin === "*" ? true : allowedOrigin }));
 
 app.use(express.json());
 
-// ----- Multer -----
+// Multer
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 } // 10MB
 });
 
-// ----- ENV -----
+// ENV
 const AZURE_STORAGE_CONNECTION = process.env.AZURE_STORAGE_CONNECTION;
 const BLOB_CONTAINER_NAME = process.env.BLOB_CONTAINER_NAME || "images";
 
@@ -35,28 +31,24 @@ const COSMOS_CONTAINER = process.env.COSMOS_CONTAINER || "photos";
 const COSMOS_COMMENT_CONTAINER = process.env.COSMOS_COMMENT_CONTAINER || "comments";
 const COSMOS_RATINGS_CONTAINER = process.env.COSMOS_RATINGS_CONTAINER || "ratings";
 
-// ----- Helpers -----
+// Helpers
 function nowIso() {
   return new Date().toISOString();
 }
-
 function toPeopleArray(raw) {
   if (!raw) return [];
-  return String(raw)
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
+  return String(raw).split(",").map(x => x.trim()).filter(Boolean);
 }
-
 function requireEnv(name, value) {
   if (!value) throw new Error(`Missing environment variable: ${name}`);
 }
-
 function cosmos() {
   requireEnv("COSMOS_ENDPOINT", COSMOS_ENDPOINT);
   requireEnv("COSMOS_KEY", COSMOS_KEY);
+
   const client = new CosmosClient({ endpoint: COSMOS_ENDPOINT, key: COSMOS_KEY });
   const db = client.database(COSMOS_DB_NAME);
+
   return {
     photos: db.container(COSMOS_CONTAINER),
     comments: db.container(COSMOS_COMMENT_CONTAINER),
@@ -64,7 +56,7 @@ function cosmos() {
   };
 }
 
-// ----- Root -----
+// Root
 app.get("/", (req, res) => {
   res.json({
     status: "MediaRG API is running ✅",
@@ -77,7 +69,7 @@ app.get("/", (req, res) => {
   });
 });
 
-// ----- PHOTOS: list -----
+// GET photos (supports q search)
 app.get("/api/photos", async (req, res) => {
   try {
     const { photos } = cosmos();
@@ -90,6 +82,7 @@ app.get("/api/photos", async (req, res) => {
             WHERE CONTAINS(LOWER(c.title), @q)
                OR CONTAINS(LOWER(c.caption), @q)
                OR CONTAINS(LOWER(c.location), @q)
+               OR ARRAY_CONTAINS(c.people, @q, true)
             ORDER BY c.createdAt DESC
           `,
           parameters: [{ name: "@q", value: q }]
@@ -107,7 +100,7 @@ app.get("/api/photos", async (req, res) => {
   }
 });
 
-// ----- PHOTOS: by id -----
+// GET photo by id
 app.get("/api/photos/:id", async (req, res) => {
   try {
     const { photos } = cosmos();
@@ -115,10 +108,7 @@ app.get("/api/photos/:id", async (req, res) => {
 
     const { resources } = await photos.items
       .query(
-        {
-          query: "SELECT * FROM c WHERE c.id=@id",
-          parameters: [{ name: "@id", value: id }]
-        },
+        { query: "SELECT * FROM c WHERE c.id=@id", parameters: [{ name: "@id", value: id }] },
         { enableCrossPartitionQuery: true }
       )
       .fetchAll();
@@ -131,11 +121,10 @@ app.get("/api/photos/:id", async (req, res) => {
   }
 });
 
-// ----- PHOTOS: upload (REAL) -----
+// POST photo (real upload)
 app.post("/api/photos", upload.single("file"), async (req, res) => {
   try {
     requireEnv("AZURE_STORAGE_CONNECTION", AZURE_STORAGE_CONNECTION);
-
     if (!req.file) return res.status(400).json({ error: "Missing file field 'file'" });
 
     const title = String(req.body.title || "").trim();
@@ -161,7 +150,7 @@ app.post("/api/photos", upload.single("file"), async (req, res) => {
 
     const url = blockBlobClient.url;
 
-    // Save metadata to Cosmos (photos)
+    // Save to Cosmos
     const { photos } = cosmos();
     const doc = {
       id,
@@ -176,7 +165,6 @@ app.post("/api/photos", upload.single("file"), async (req, res) => {
     };
 
     await photos.items.create(doc);
-
     res.status(201).json({ message: "Photo uploaded", photo: doc });
   } catch (err) {
     console.error("POST /api/photos error:", err);
@@ -184,9 +172,7 @@ app.post("/api/photos", upload.single("file"), async (req, res) => {
   }
 });
 
-// -------------------- COMMENTS --------------------
-
-// GET comments for a photo
+// COMMENTS - GET
 app.get("/api/photos/:id/comments", async (req, res) => {
   try {
     const { comments } = cosmos();
@@ -209,7 +195,7 @@ app.get("/api/photos/:id/comments", async (req, res) => {
   }
 });
 
-// POST a comment
+// COMMENTS - POST
 app.post("/api/photos/:id/comments", async (req, res) => {
   try {
     const { comments } = cosmos();
@@ -235,36 +221,7 @@ app.post("/api/photos/:id/comments", async (req, res) => {
   }
 });
 
-// -------------------- RATINGS --------------------
-
-// GET rating summary for a photo
-app.get("/api/photos/:id/rating", async (req, res) => {
-  try {
-    const { ratings } = cosmos();
-    const photoId = String(req.params.id);
-
-    const { resources } = await ratings.items
-      .query(
-        {
-          query: "SELECT c.value FROM c WHERE c.photoId=@photoId",
-          parameters: [{ name: "@photoId", value: photoId }]
-        },
-        { enableCrossPartitionQuery: true }
-      )
-      .fetchAll();
-
-    const values = resources.map((r) => Number(r.value)).filter((n) => Number.isFinite(n));
-    const count = values.length;
-    const avg = count ? values.reduce((a, b) => a + b, 0) / count : 0;
-
-    res.json({ photoId, count, average: Number(avg.toFixed(2)) });
-  } catch (err) {
-    console.error("GET rating error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// POST rating (upsert by photoId + userKey)
+// RATINGS - POST (upsert per photoId+userKey)
 app.post("/api/photos/:id/rating", async (req, res) => {
   try {
     const { ratings } = cosmos();
@@ -294,7 +251,40 @@ app.post("/api/photos/:id/rating", async (req, res) => {
   }
 });
 
-// ----- Start -----
+// RATINGS - GET summary (FIXED)
+app.get("/api/photos/:id/rating", async (req, res) => {
+  try {
+    const { ratings } = cosmos();
+    const photoId = String(req.params.id);
+
+    const querySpec = {
+      query: `
+        SELECT VALUE {
+          "count": COUNT(1),
+          "sum":  SUM(c.value)
+        }
+        FROM c
+        WHERE c.photoId = @photoId
+      `,
+      parameters: [{ name: "@photoId", value: photoId }]
+    };
+
+    const { resources } = await ratings.items
+      .query(querySpec, { enableCrossPartitionQuery: true })
+      .fetchAll();
+
+    const agg = resources?.[0] || { count: 0, sum: 0 };
+    const count = Number(agg.count || 0);
+    const sum = Number(agg.sum || 0);
+    const average = count > 0 ? Number((sum / count).toFixed(2)) : 0;
+
+    res.json({ photoId, count, average });
+  } catch (err) {
+    console.error("GET rating error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Start
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ MediaRG API running on port ${PORT}`));
-
