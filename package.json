@@ -1,7 +1,6 @@
 {
   "name": "mediargapi",
   "version": "1.0.0",
-  "description": "MediaRG photo sharing REST API (Azure Blob + Cosmos DB)",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
