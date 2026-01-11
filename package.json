@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "echo \"No tests yet\""
+    "test": "echo \"No tests yet\" && exit 0"
   },
   "type": "commonjs",
   "dependencies": {
@@ -16,4 +16,5 @@
     "@azure/cosmos": "^3.18.0"
   }
 }
+
 
