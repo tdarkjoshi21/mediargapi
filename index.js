@@ -221,13 +221,15 @@ app.post("/api/photos/:id/comments", async (req, res) => {
   }
 });
 
-// RATINGS - POST (upsert per photoId+userKey)
+// RATINGS - POST (upsert per photoId+userKey) ✅ FIXED
 app.post("/api/photos/:id/rating", async (req, res) => {
   try {
     const { ratings } = cosmos();
     const photoId = String(req.params.id);
 
-    const value = Number(req.body?.value);
+    // ✅ accept both "value" and "rating"
+    const value = Number(req.body?.value ?? req.body?.rating);
+
     if (!Number.isFinite(value) || value < 1 || value > 5) {
       return res.status(400).json({ error: "Rating must be 1..5" });
     }
@@ -251,7 +253,7 @@ app.post("/api/photos/:id/rating", async (req, res) => {
   }
 });
 
-// RATINGS - GET summary (FIXED)
+// RATINGS - GET summary ✅ FIXED (avoid Cosmos 'VALUE' syntax issue)
 app.get("/api/photos/:id/rating", async (req, res) => {
   try {
     const { ratings } = cosmos();
@@ -259,10 +261,9 @@ app.get("/api/photos/:id/rating", async (req, res) => {
 
     const querySpec = {
       query: `
-        SELECT VALUE {
-          "count": COUNT(1),
-          "sum":  SUM(c.value)
-        }
+        SELECT
+          COUNT(1) AS count,
+          SUM(c.value) AS sum
         FROM c
         WHERE c.photoId = @photoId
       `,
@@ -273,9 +274,9 @@ app.get("/api/photos/:id/rating", async (req, res) => {
       .query(querySpec, { enableCrossPartitionQuery: true })
       .fetchAll();
 
-    const agg = resources?.[0] || { count: 0, sum: 0 };
-    const count = Number(agg.count || 0);
-    const sum = Number(agg.sum || 0);
+    const row = resources?.[0] || { count: 0, sum: 0 };
+    const count = Number(row.count || 0);
+    const sum = Number(row.sum || 0); // SUM can be null -> becomes 0 here
     const average = count > 0 ? Number((sum / count).toFixed(2)) : 0;
 
     res.json({ photoId, count, average });
@@ -288,4 +289,3 @@ app.get("/api/photos/:id/rating", async (req, res) => {
 // Start
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ MediaRG API running on port ${PORT}`));
-
