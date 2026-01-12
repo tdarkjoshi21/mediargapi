@@ -1,19 +1,26 @@
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
+
 const { BlobServiceClient } = require("@azure/storage-blob");
 const { CosmosClient } = require("@azure/cosmos");
 
 const app = express();
 
-// ---------------- ENV ----------------
-const PORT = process.env.PORT || 3000;
+// CORS
+const allowedOrigin = process.env.CORS_ORIGIN || "*";
+app.use(cors({ origin: allowedOrigin === "*" ? true : allowedOrigin }));
 
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+app.use(express.json());
 
-const AZURE_STORAGE_CONNECTION_STRING =
-  process.env.AZURE_STORAGE_CONNECTION_STRING || process.env.AZURE_STORAGE_CONNECTION;
+// Multer
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB
+});
 
+// ENV
+const AZURE_STORAGE_CONNECTION = process.env.AZURE_STORAGE_CONNECTION;
 const BLOB_CONTAINER_NAME = process.env.BLOB_CONTAINER_NAME || "images";
 
 const COSMOS_ENDPOINT = process.env.COSMOS_ENDPOINT;
@@ -24,29 +31,18 @@ const COSMOS_CONTAINER = process.env.COSMOS_CONTAINER || "photos";
 const COSMOS_COMMENT_CONTAINER = process.env.COSMOS_COMMENT_CONTAINER || "comments";
 const COSMOS_RATINGS_CONTAINER = process.env.COSMOS_RATINGS_CONTAINER || "ratings";
 
-// ---------------- MIDDLEWARE ----------------
-app.use(
-  cors({
-    origin: CORS_ORIGIN,
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"]
-  })
-);
-
-app.use(express.json());
-
-// upload memory
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB
-});
-
-// ---------------- CLIENTS ----------------
+// Helpers
+function nowIso() {
+  return new Date().toISOString();
+}
+function toPeopleArray(raw) {
+  if (!raw) return [];
+  return String(raw).split(",").map(x => x.trim()).filter(Boolean);
+}
 function requireEnv(name, value) {
   if (!value) throw new Error(`Missing environment variable: ${name}`);
 }
-
-function getCosmos() {
+function cosmos() {
   requireEnv("COSMOS_ENDPOINT", COSMOS_ENDPOINT);
   requireEnv("COSMOS_KEY", COSMOS_KEY);
 
@@ -60,199 +56,175 @@ function getCosmos() {
   };
 }
 
-function getBlobContainer() {
-  requireEnv("AZURE_STORAGE_CONNECTION_STRING", AZURE_STORAGE_CONNECTION_STRING);
-  const blobService = BlobServiceClient.fromConnectionString(AZURE_STORAGE_CONNECTION_STRING);
-  return blobService.getContainerClient(BLOB_CONTAINER_NAME);
-}
-
-function nowISO() {
-  return new Date().toISOString();
-}
-
-function peopleList(peopleStr) {
-  if (!peopleStr) return [];
-  return String(peopleStr)
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean)
-    .slice(0, 30);
-}
-
-// ---------------- ROUTES ----------------
-app.get("/", (req, res) => res.send("MediaRG API is running ✅"));
-
-// OPTIONAL: debug env (does not leak secrets)
-app.get("/api/_debug/env", (req, res) => {
+// Root
+app.get("/", (req, res) => {
   res.json({
-    CORS_ORIGIN,
-    BLOB_CONTAINER_NAME,
-    COSMOS_DB_NAME,
-    COSMOS_CONTAINER,
-    COSMOS_COMMENT_CONTAINER,
-    COSMOS_RATINGS_CONTAINER,
-    HAS_STORAGE: !!AZURE_STORAGE_CONNECTION_STRING,
-    HAS_COSMOS_ENDPOINT: !!COSMOS_ENDPOINT,
-    HAS_COSMOS_KEY: !!COSMOS_KEY
+    status: "MediaRG API is running ✅",
+    corsOrigin: allowedOrigin,
+    containers: {
+      photos: COSMOS_CONTAINER,
+      comments: COSMOS_COMMENT_CONTAINER,
+      ratings: COSMOS_RATINGS_CONTAINER
+    }
   });
 });
 
-// -------- PHOTOS --------
-
-// GET all photos
+// GET photos (supports q search)
 app.get("/api/photos", async (req, res) => {
   try {
-    const { photos } = getCosmos();
+    const { photos } = cosmos();
+    const q = String(req.query.q || "").trim().toLowerCase();
+
+    const querySpec = q
+      ? {
+          query: `
+            SELECT * FROM c
+            WHERE CONTAINS(LOWER(c.title), @q)
+               OR CONTAINS(LOWER(c.caption), @q)
+               OR CONTAINS(LOWER(c.location), @q)
+               OR ARRAY_CONTAINS(c.people, @q, true)
+            ORDER BY c.createdAt DESC
+          `,
+          parameters: [{ name: "@q", value: q }]
+        }
+      : { query: "SELECT * FROM c ORDER BY c.createdAt DESC" };
+
     const { resources } = await photos.items
-      .query("SELECT * FROM c ORDER BY c.createdAt DESC", { enableCrossPartitionQuery: true })
+      .query(querySpec, { enableCrossPartitionQuery: true })
       .fetchAll();
 
-    res.json(resources || []);
+    res.json(resources);
   } catch (err) {
     console.error("GET /api/photos error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET photo by id (query to avoid partition key mismatch)
+// GET photo by id
 app.get("/api/photos/:id", async (req, res) => {
   try {
-    const { photos } = getCosmos();
+    const { photos } = cosmos();
     const id = String(req.params.id);
 
-    const querySpec = {
-      query: "SELECT * FROM c WHERE c.id = @id",
-      parameters: [{ name: "@id", value: id }]
-    };
-
     const { resources } = await photos.items
-      .query(querySpec, { enableCrossPartitionQuery: true })
+      .query(
+        { query: "SELECT * FROM c WHERE c.id=@id", parameters: [{ name: "@id", value: id }] },
+        { enableCrossPartitionQuery: true }
+      )
       .fetchAll();
 
-    const photo = resources?.[0];
-    if (!photo) return res.status(404).json({ error: "Photo not found" });
-
-    res.json(photo);
+    if (!resources.length) return res.status(404).json({ error: "Photo not found" });
+    res.json(resources[0]);
   } catch (err) {
     console.error("GET /api/photos/:id error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST upload photo (file + metadata) -> Blob + Cosmos
+// POST photo (real upload)
 app.post("/api/photos", upload.single("file"), async (req, res) => {
   try {
-    const file = req.file;
-    const title = String(req.body?.title || "").trim();
+    requireEnv("AZURE_STORAGE_CONNECTION", AZURE_STORAGE_CONNECTION);
+    if (!req.file) return res.status(400).json({ error: "Missing file field 'file'" });
 
-    if (!file) return res.status(400).json({ error: "file is required" });
-    if (!title) return res.status(400).json({ error: "title is required" });
+    const title = String(req.body.title || "").trim();
+    const caption = String(req.body.caption || "").trim();
+    const location = String(req.body.location || "").trim();
+    const people = toPeopleArray(req.body.people);
 
-    const caption = String(req.body?.caption || "").trim();
-    const location = String(req.body?.location || "").trim();
-    const people = peopleList(req.body?.people);
+    if (!title) return res.status(400).json({ error: "Title is required" });
 
-    // upload blob
-    const container = getBlobContainer();
-    await container.createIfNotExists({ access: "blob" });
+    // Upload to Blob
+    const blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_STORAGE_CONNECTION);
+    const containerClient = blobServiceClient.getContainerClient(BLOB_CONTAINER_NAME);
+    await containerClient.createIfNotExists({ access: "blob" });
 
-    const photoId = String(Date.now());
-    const ext = (file.originalname || "jpg").split(".").pop() || "jpg";
-    const blobName = `${photoId}.${ext}`;
+    const ext = (req.file.originalname.split(".").pop() || "jpg").toLowerCase();
+    const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const blobName = `${id}.${ext}`;
 
-    const blobClient = container.getBlockBlobClient(blobName);
-    await blobClient.uploadData(file.buffer, {
-      blobHTTPHeaders: { blobContentType: file.mimetype || "image/jpeg" }
+    const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+    await blockBlobClient.uploadData(req.file.buffer, {
+      blobHTTPHeaders: { blobContentType: req.file.mimetype }
     });
 
-    const url = blobClient.url;
+    const url = blockBlobClient.url;
 
-    // save cosmos metadata
-    const { photos } = getCosmos();
+    // Save to Cosmos
+    const { photos } = cosmos();
     const doc = {
-      id: photoId,
-      photoId,
+      id,
       title,
       caption,
       location,
       people,
-      url,
       blobName,
-      createdAt: nowISO()
+      url,
+      contentType: req.file.mimetype,
+      createdAt: nowIso()
     };
 
-    await photos.items.upsert(doc);
-
-    res.status(201).json(doc);
+    await photos.items.create(doc);
+    res.status(201).json({ message: "Photo uploaded", photo: doc });
   } catch (err) {
     console.error("POST /api/photos error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// -------- COMMENTS --------
-
-// GET comments
+// COMMENTS - GET
 app.get("/api/photos/:id/comments", async (req, res) => {
   try {
-    const { comments } = getCosmos();
+    const { comments } = cosmos();
     const photoId = String(req.params.id);
 
-    const querySpec = {
-      query: "SELECT * FROM c WHERE c.photoId = @photoId ORDER BY c.createdAt DESC",
-      parameters: [{ name: "@photoId", value: photoId }]
-    };
-
     const { resources } = await comments.items
-      .query(querySpec, { enableCrossPartitionQuery: true })
+      .query(
+        {
+          query: "SELECT * FROM c WHERE c.photoId=@photoId ORDER BY c.createdAt DESC",
+          parameters: [{ name: "@photoId", value: photoId }]
+        },
+        { enableCrossPartitionQuery: true }
+      )
       .fetchAll();
 
-    res.json(resources || []);
+    res.json(resources);
   } catch (err) {
     console.error("GET comments error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST comment
+// COMMENTS - POST
 app.post("/api/photos/:id/comments", async (req, res) => {
   try {
-    const { comments } = getCosmos();
+    const { comments } = cosmos();
     const photoId = String(req.params.id);
 
-    const name = String(req.body?.name || "").trim().slice(0, 80) || "Anonymous";
-    const text = String(req.body?.text || "").trim().slice(0, 1000);
-
-    if (!text) return res.status(400).json({ error: "text is required" });
+    const name = String(req.body?.name || "Anonymous").trim();
+    const text = String(req.body?.text || "").trim();
+    if (!text) return res.status(400).json({ error: "Comment text required" });
 
     const doc = {
-      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      id: `${photoId}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       photoId,
       name,
       text,
-      createdAt: nowISO()
+      createdAt: nowIso()
     };
 
-    // if your comments container is partitioned by /photoId, this helps
-    try {
-      await comments.items.create(doc);
-    } catch {
-      await comments.items.create(doc, { partitionKey: photoId });
-    }
-
-    res.status(201).json(doc);
+    await comments.items.create(doc);
+    res.status(201).json({ message: "Comment added", comment: doc });
   } catch (err) {
     console.error("POST comment error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// -------- RATINGS (FIXED for partition key /photoId) --------
-
-// POST rating
+// RATINGS - POST (upsert per photoId+userKey)
 app.post("/api/photos/:id/rating", async (req, res) => {
   try {
-    const { ratings } = getCosmos();
+    const { ratings } = cosmos();
     const photoId = String(req.params.id);
 
     const value = Number(req.body?.value);
@@ -261,21 +233,17 @@ app.post("/api/photos/:id/rating", async (req, res) => {
     }
 
     const userKey = String(req.body?.userKey || "anon").slice(0, 120);
-
-    // one rating per user per photo
     const id = `${photoId}::${userKey}`;
 
     const doc = {
       id,
-      photoId, // ✅ REQUIRED because your partition key is /photoId
+      photoId,
       userKey,
       value,
-      updatedAt: nowISO()
+      updatedAt: nowIso()
     };
 
-    // ✅ REQUIRED because your ratings partition key is /photoId
-    await ratings.items.upsert(doc, { partitionKey: photoId });
-
+    await ratings.items.upsert(doc);
     res.status(201).json({ message: "Rating saved", rating: doc });
   } catch (err) {
     console.error("POST rating error:", err);
@@ -283,15 +251,18 @@ app.post("/api/photos/:id/rating", async (req, res) => {
   }
 });
 
-// GET rating summary
+// RATINGS - GET summary (FIXED)
 app.get("/api/photos/:id/rating", async (req, res) => {
   try {
-    const { ratings } = getCosmos();
+    const { ratings } = cosmos();
     const photoId = String(req.params.id);
 
     const querySpec = {
       query: `
-        SELECT VALUE { "count": COUNT(1), "avg": AVG(c.value) }
+        SELECT VALUE {
+          "count": COUNT(1),
+          "sum":  SUM(c.value)
+        }
         FROM c
         WHERE c.photoId = @photoId
       `,
@@ -302,9 +273,10 @@ app.get("/api/photos/:id/rating", async (req, res) => {
       .query(querySpec, { enableCrossPartitionQuery: true })
       .fetchAll();
 
-    const agg = resources?.[0] || { count: 0, avg: 0 };
+    const agg = resources?.[0] || { count: 0, sum: 0 };
     const count = Number(agg.count || 0);
-    const average = count > 0 ? Number(Number(agg.avg).toFixed(2)) : 0;
+    const sum = Number(agg.sum || 0);
+    const average = count > 0 ? Number((sum / count).toFixed(2)) : 0;
 
     res.json({ photoId, count, average });
   } catch (err) {
@@ -313,6 +285,7 @@ app.get("/api/photos/:id/rating", async (req, res) => {
   }
 });
 
-// ---------------- START ----------------
-app.listen(PORT, () => console.log(`API running on port ${PORT}`));
+// Start
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ MediaRG API running on port ${PORT}`));
 
